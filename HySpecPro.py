@@ -19,7 +19,7 @@ import torch
 import numpy as np
 from helper import read_hgr
 
-import os, argparse
+import os, argparse, itertools
 import cma
 import cupy as cp
 from torch.utils.dlpack import to_dlpack, from_dlpack
@@ -75,7 +75,10 @@ batch_size_dict = {
     "HV15R.mtx": 130,
     "StocF-1465.mtx": 200,
     "circuit5M.mtx": 100,
-    "dgreen.mtx": 300
+    "dgreen.mtx": 300,
+    "sha256": 1200,
+    "aes": 1500,
+    "part": 1500,
 }
 
 PARTITION_DTYPE = torch.uint8
@@ -161,8 +164,82 @@ def bipartite_spectral_embeddings_from_dgl(g, etype=('cell','connect','net'), k=
     # Return cupy eigenvalues and torch embeddings for cells
     return eigvals_cp, eigvecs_cells_torch
 
+
+def load_driver_edges(path):
+    """Driver to sink edges. Accepts a DAG dot file or a JSON list of [src, dst]."""
+    text = open(path).read().strip()
+    if text.startswith("{") or text.startswith("["):
+        import json
+        raw = json.loads(text)
+        return [(int(a), int(b)) for a, b in raw]
+    edges = []
+    for line in text.splitlines():
+        if "->" not in line:
+            continue
+        a, b = line.replace(";", "").split("->")
+        edges.append((int(a), int(b)))
+    return edges
+
+
+def topo_from_edges(n, edges):
+    succ = [[] for _ in range(n)]
+    indeg = np.zeros(n, dtype=np.int32)
+    for u, v in edges:
+        if v not in succ[u]:
+            succ[u].append(v)
+            indeg[v] += 1
+    for u in range(n):
+        succ[u].sort()
+    topo = [int(i) for i in np.flatnonzero(indeg == 0)]
+    for u in topo:
+        for v in succ[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                topo.append(v)
+    if len(topo) != n:
+        raise ValueError(f"driver graph has a cycle, ordered {len(topo)}/{n}")
+    return succ, topo
+
+
+def order_embedding_from_spectral(spec, edges, dim=8):
+    """X = [X_spec | X_max | X_min] on the cell coordinates already on GPU.
+
+    spec is the smallest nontrivial bipartite-Laplacian eigenvectors.
+    Takes the first `dim` columns; output width is 3*dim.
+    Sign is fixed so driver to sink increases.
+    U/L are hard envelopes along the driver DAG (max forward / min backward).
+    """
+    if spec.shape[1] < dim:
+        raise ValueError(f"need {dim} spectral columns, got {spec.shape[1]}")
+    device = spec.device
+    F = spec[:, :dim].detach().float().cpu().numpy()
+    n = F.shape[0]
+    succ, topo = topo_from_edges(n, edges)
+    eu = np.asarray([u for u, vs in enumerate(succ) for v in vs], dtype=np.int64)
+    ev = np.asarray([v for vs in succ for v in vs], dtype=np.int64)
+    for j in range(F.shape[1]):
+        if np.sum(F[ev, j] - F[eu, j]) < 0:
+            F[:, j] *= -1.0
+    ptp = np.maximum(np.ptp(F, axis=0), 1e-12)
+    F = (F - F.min(0)) / ptp
+    std = np.maximum(F.std(0), 1e-12)
+    Xs = F / std
+    delta = 1e-4 * std
+    U = F.copy()
+    L = F.copy()
+    for u in topo:
+        for v in succ[u]:
+            np.maximum(U[v], U[u] + delta, out=U[v])
+    for u in reversed(topo):
+        for v in succ[u]:
+            np.minimum(L[u], L[v] - delta, out=L[u])
+    Xo = np.concatenate((U, L), axis=1)
+    Xo = Xo / np.maximum(Xo.std(0), 1e-12)
+    X = np.concatenate((Xs, Xo), axis=1).astype(np.float32)
+    return torch.from_numpy(X).to(device)
+
 # main function to run the partitioner
-def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KWAY, UB):
+def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KWAY, UB, drivers_path=None, lambda_f=1.0):
 
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -185,6 +262,8 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
     hgr_file = config["hgr_file"]
     use_weight = config["use_weight"]
     N_batch = config["N_batch"]
+    if os.environ.get("HYSP_NBATCH"):
+        N_batch = int(os.environ["HYSP_NBATCH"])
     K = config["K"]
     e = config["e"]
 
@@ -197,45 +276,107 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
     th_l = W*(1/K - e)
     th_u = W*(1/K + e)
     print("Partition size constraints: ", th_l, th_u)
+    driver_of_net = None
+    use_affine = False
+    if drivers_path:
+        succ = [set() for _ in range(cell_cnt)]
+        for u, v in load_driver_edges(drivers_path):
+            succ[u].add(v)
+        cells_e, nets_e = g.edges(etype="connect")
+        pins_of = [[] for _ in range(net_cnt)]
+        for c, e in zip(cells_e.tolist(), nets_e.tolist()):
+            pins_of[e].append(c)
+        drv = [-1] * net_cnt
+        known = 0
+        for e, pins in enumerate(pins_of):
+            hits = [p for p in pins if all(q == p or q in succ[p] for q in pins)]
+            if len(hits) == 1:
+                drv[e] = hits[0]
+                known += 1
+        driver_of_net = torch.tensor(drv, device=device, dtype=torch.long)
+        # K=2: affine halfspace sign(Xw+b). K>2: HySpecPro argmax projection.
+        use_affine = (K == 2)
+        dec = "affine" if use_affine else f"proj-{K}"
+        print(f"J = C + {lambda_f} * F_net, drivers on {known}/{net_cnt} nets, decoder={dec}")
 
     # batch evaluation function
     def evaluation(g, population):
         cell_cnt, B = population.shape
         with torch.no_grad():
-            # Use float32 0/1 assignments for efficient DGL message passing
-            assign_b = population.to(device=device, dtype=torch.float32)
-            g.nodes["cell"].data["assign_b"] = assign_b
-
-            # Aggregate number of part-1 pins per net per head
-            g['connect'].update_all(fn.copy_u('assign_b', 'm'), fn.sum('m', 'net_sum1'), etype='connect')
-            net_sum1 = g.nodes["net"].data["net_sum1"].to(torch.float32)
-
-            # Cache per-net degree as [net_cnt, 1] and rely on broadcasting.
-            # This avoids materializing a large [net_cnt, B] tensor on L_HG cases.
+            pop = population.to(device=device)
             deg_col = g.nodes["net"].data.get("deg_col", None)
             if deg_col is None:
                 deg = g.in_degrees(torch.arange(g.num_nodes('net'), device=device), etype='connect').to(torch.float32)
                 deg_col = deg.view(-1, 1)
                 g.nodes["net"].data["deg_col"] = deg_col
 
-            # A net is cut if it has at least one pin in both parts
-            net_cut = (net_sum1 > 0.0) & (net_sum1 < deg_col)
-            N_cut = net_cut.sum(dim=0).to(torch.float32)
-
-            # Balance penalty
-            if use_weight:
-                # Fallback to one-hot path only when weighted cells are enabled
-                temp = torch.zeros([cell_cnt, B, K], device=device, dtype=torch.float32)
-                temp.scatter_(2, population.unsqueeze(2).long(), 1)
-                w = torch.sum(g.nodes["cell"].data["weight"].reshape(-1, 1, 1) * temp, 0)
-                penalty = 50 * torch.sum(torch.relu(w - th_u) + torch.relu(th_l - w), 1)
+            if K == 2:
+                # Fast binary path: part-1 pin counts.
+                assign_b = pop.to(dtype=torch.float32)
+                g.nodes["cell"].data["assign_b"] = assign_b
+                g['connect'].update_all(fn.copy_u('assign_b', 'm'), fn.sum('m', 'net_sum1'), etype='connect')
+                net_sum1 = g.nodes["net"].data["net_sum1"].to(torch.float32)
+                net_cut = (net_sum1 > 0.0) & (net_sum1 < deg_col)
+                N_cut = net_cut.sum(dim=0).to(torch.float32)
+                if use_weight:
+                    temp = torch.zeros([cell_cnt, B, K], device=device, dtype=torch.float32)
+                    temp.scatter_(2, pop.unsqueeze(2).long(), 1)
+                    w = torch.sum(g.nodes["cell"].data["weight"].reshape(-1, 1, 1) * temp, 0)
+                    penalty = 50 * torch.sum(torch.relu(w - th_u) + torch.relu(th_l - w), 1)
+                else:
+                    ones_per_batch = assign_b.sum(dim=0)
+                    zeros_per_batch = float(cell_cnt) - ones_per_batch
+                    weight_mat = torch.stack([zeros_per_batch, ones_per_batch], dim=1)
+                    penalty = 50.0 * torch.sum(torch.relu(weight_mat - th_u) + torch.relu(th_l - weight_mat), dim=1)
+                feedback = torch.zeros(B, device=device)
+                if driver_of_net is not None:
+                    known = driver_of_net >= 0
+                    drv_part = assign_b[driver_of_net.clamp(min=0)]
+                    back_01 = ((drv_part > 0.5) & (net_sum1 < deg_col) & known.unsqueeze(1)).sum(0)
+                    back_10 = ((drv_part < 0.5) & (net_sum1 > 0.0) & known.unsqueeze(1)).sum(0)
+                    feedback = torch.minimum(back_01, back_10).float()
             else:
-                ones_per_batch = assign_b.sum(dim=0)
-                zeros_per_batch = float(cell_cnt) - ones_per_batch
-                weight_mat = torch.stack([zeros_per_batch, ones_per_batch], dim=1)  # [B,2]
-                penalty = 50.0 * torch.sum(torch.relu(weight_mat - th_u) + torch.relu(th_l - weight_mat), dim=1)
-
-            score = (N_cut + penalty).cpu()
+                # K-way cut: a net is cut if it touches more than one part.
+                parts_present = []
+                for k in range(K):
+                    mask_k = (pop == k).to(torch.float32)
+                    g.nodes["cell"].data["assign_k"] = mask_k
+                    g['connect'].update_all(fn.copy_u('assign_k', 'm'), fn.sum('m', 'net_k'), etype='connect')
+                    parts_present.append(g.nodes["net"].data["net_k"] > 0)
+                n_parts = torch.stack(parts_present, dim=-1).sum(dim=-1)
+                net_cut = n_parts > 1
+                N_cut = net_cut.sum(dim=0).to(torch.float32)
+                if use_weight:
+                    temp = torch.zeros([cell_cnt, B, K], device=device, dtype=torch.float32)
+                    temp.scatter_(2, pop.unsqueeze(2).long(), 1)
+                    w = torch.sum(g.nodes["cell"].data["weight"].reshape(-1, 1, 1) * temp, 0)
+                else:
+                    w = torch.stack([(pop == k).to(torch.float32).sum(dim=0) for k in range(K)], dim=1)
+                penalty = 50.0 * torch.sum(torch.relu(w - th_u) + torch.relu(th_l - w), dim=1)
+                feedback = torch.zeros(B, device=device)
+                if driver_of_net is not None:
+                    # F_net = min over block orders. Exact for K<=7; else random sample.
+                    known = driver_of_net >= 0
+                    drv_cell = driver_of_net.clamp(min=0)
+                    best_fb = None
+                    if K <= 7:
+                        perm_iter = itertools.permutations(range(K))
+                    else:
+                        rng = np.random.default_rng(0)
+                        perm_iter = [tuple(range(K))] + [
+                            tuple(rng.permutation(K).tolist()) for _ in range(64)
+                        ]
+                    for perm in perm_iter:
+                        rank_of = torch.tensor(perm, device=device, dtype=torch.long)
+                        cell_rank = rank_of[pop.long()]
+                        g.nodes["cell"].data["rank"] = cell_rank.to(torch.float32)
+                        g['connect'].update_all(fn.copy_u('rank', 'm'), fn.min('m', 'net_min_rank'), etype='connect')
+                        net_min = g.nodes["net"].data["net_min_rank"]
+                        drv_rank = cell_rank[drv_cell].to(torch.float32)
+                        fb = ((net_min < drv_rank) & known.unsqueeze(1) & net_cut).sum(0).float()
+                        best_fb = fb if best_fb is None else torch.minimum(best_fb, fb)
+                    feedback = best_fb
+            score = (N_cut + lambda_f * feedback + penalty).cpu()
             return score
 
     # conduct CMA-ES
@@ -257,7 +398,9 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
                     Np = 3 # population size = N_batch * Np * Ns, where Np is the parallelization factor and Ns is the sequential factor
                     Ns = 1
                     Na = 1
-                    es = cma.CMAEvolutionStrategy(np.zeros((N_embed)*2*Na), sigma, {'popsize': N_batch * Np * Ns})
+                    # Affine (K=2): |w|+1. Else HySpecPro projections: N_embed * K.
+                    cma_dim = (N_embed + 1) if use_affine else (N_embed * K * Na)
+                    es = cma.CMAEvolutionStrategy(np.zeros(cma_dim), sigma, {'popsize': N_batch * Np * Ns})
                     unchange_cnt = 0
                     global_min = 100000000.0
                     RELU = torch.nn.ReLU().to(device)
@@ -267,40 +410,61 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
                             break
                         # sample a new population
                         assign_W = es.ask()
-                        assign_W_torch  = np.array(assign_W)
-                        assign_W_torch  = torch.from_numpy(assign_W_torch).reshape(-1, Na, N_embed, 2).to(device).float() # N_batch * Np * Ns, N_embed, 1
-
-                        # evaluate the population
+                        assign_W_np = np.array(assign_W, dtype=np.float32)
                         temp_score_list = []
-                        for s in range(Ns):
-                            assign_W_torch_s = assign_W_torch[N_batch * Np * s : N_batch * Np * (s+1)]
-                            if K == 2:
-                                # Binary case: argmax([x^T w0, x^T w1]) is
-                                # equivalent to x^T(w1-w0) > 0.  This avoids
-                                # materializing logits with shape [N, B, 2].
-                                w_delta = (assign_W_torch_s[..., 1] - assign_W_torch_s[..., 0]).sum(dim=1)
-                                logits_delta = embed @ w_delta.T
-                                solution = (logits_delta > 0).to(PARTITION_DTYPE)
-                                del w_delta, logits_delta
-                            else:
-                                logits = torch.einsum('ne,paek->pank', embed, assign_W_torch_s)
-                                logits = logits.sum(dim=1)
-                                logits = logits.permute(1, 0, 2)
-                                solution = torch.argmax(logits, 2).to(PARTITION_DTYPE)
-                                del logits
+                        if use_affine:
+                            # y_v = 1[x_v^T w + b > 0]. Same GPU matmul cost as origin-forced sign.
+                            wb = torch.from_numpy(assign_W_np).to(device).float()
+                            w = wb[:, :N_embed]
+                            b = wb[:, N_embed]
+                            logits = embed @ w.T + b
+                            solution = (logits > 0).to(PARTITION_DTYPE)
+                            del wb, w, b, logits
                             score = evaluation(g, solution)
                             temp_score_list.append(score.detach())
-
                             if best_score is None:
                                 best_score = score.detach()
                                 best_solution = solution.detach()
                             else:
                                 mask = score < best_score
                                 best_score[mask] = score[mask]
-                                best_solution[:,mask] = solution[:,mask].detach()
+                                best_solution[:, mask] = solution[:, mask].detach()
                                 del mask
+                            del solution, score
+                        else:
+                            assign_W_torch = torch.from_numpy(assign_W_np).reshape(-1, Na, N_embed, K).to(device).float()
 
-                            del solution, score, assign_W_torch_s
+                            # evaluate the population
+                            for s in range(Ns):
+                                assign_W_torch_s = assign_W_torch[N_batch * Np * s : N_batch * Np * (s+1)]
+                                if K == 2:
+                                    # Binary case: argmax([x^T w0, x^T w1]) is
+                                    # equivalent to x^T(w1-w0) > 0.  This avoids
+                                    # materializing logits with shape [N, B, 2].
+                                    w_delta = (assign_W_torch_s[..., 1] - assign_W_torch_s[..., 0]).sum(dim=1)
+                                    logits_delta = embed @ w_delta.T
+                                    solution = (logits_delta > 0).to(PARTITION_DTYPE)
+                                    del w_delta, logits_delta
+                                else:
+                                    logits = torch.einsum('ne,paek->pank', embed, assign_W_torch_s)
+                                    logits = logits.sum(dim=1)
+                                    logits = logits.permute(1, 0, 2)
+                                    solution = torch.argmax(logits, 2).to(PARTITION_DTYPE)
+                                    del logits
+                                score = evaluation(g, solution)
+                                temp_score_list.append(score.detach())
+
+                                if best_score is None:
+                                    best_score = score.detach()
+                                    best_solution = solution.detach()
+                                else:
+                                    mask = score < best_score
+                                    best_score[mask] = score[mask]
+                                    best_solution[:,mask] = solution[:,mask].detach()
+                                    del mask
+
+                                del solution, score, assign_W_torch_s
+                            del assign_W_torch
 
                         temp_score_list = torch.cat(temp_score_list, 0).cpu().tolist()
                         # print("temp_score_list: ", len(temp_score_list))
@@ -314,7 +478,7 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
                         # update the CMA-ES with the population scores
                         es.tell(assign_W, temp_score_list)
                         es.disp()
-                        del assign_W_torch, assign_W
+                        del assign_W
                     del es
                     print("best score after CMA-ES: ", best_score.min())
 
@@ -443,7 +607,24 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
     mask = eigvals > 1e-6
     eigvals = eigvals[mask]
     eigvecs_cells_torch = eigvecs_cells_torch[:, mask]
-    embed_list += [eigvecs_cells_torch[:, :4], eigvecs_cells_torch[:, :8], eigvecs_cells_torch[:, :16], eigvecs_cells_torch[:, :24], eigvecs_cells_torch[:, :36]]
+    if drivers_path:
+        _ordim = int(os.environ.get("HYSP_ORDIM", "8"))
+        if os.environ.get("HYSP_SPEC_ONLY") == "1":
+            # Ablation: same J / affine / drivers, but X is spectral only (no U/L).
+            X = eigvecs_cells_torch[:, :_ordim]
+            print(f"spectral-only X (no order): {tuple(X.shape)}")
+        else:
+            # dim spectral + hard U/L envelopes => 3*dim.
+            X = order_embedding_from_spectral(
+                eigvecs_cells_torch, load_driver_edges(drivers_path), dim=_ordim
+            )
+            print(f"order embedding X: {tuple(X.shape)}")
+        embed_list += [X]
+    else:
+        if os.environ.get("HYSP_BASE8") == "1":
+            embed_list += [eigvecs_cells_torch[:, :8]]
+        else:
+            embed_list += [eigvecs_cells_torch[:, :4], eigvecs_cells_torch[:, :8], eigvecs_cells_torch[:, :16], eigvecs_cells_torch[:, :24], eigvecs_cells_torch[:, :36]]
 
     best_solution, best_score = CMA_ES_iterations(g, embed_list)
     print("Best score after CMA-ES on all embedding spaces: ", best_score.min())
@@ -460,23 +641,26 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
     elif total_edge_degree >= 50_000_000:
         topK = 8
 
-    print(f"FM/KL topK: {topK} (total_edge_degree={total_edge_degree})")
-    best_assign = best_solution[:,:topK].to(device)
-    try:
-        refined_assign, did_improve = fm_kl_refine_batch(g, best_assign, th_l, th_u, max_passes=10)
-    except torch.cuda.OutOfMemoryError as oom:
-        print(f"FM/KL refinement skipped due to CUDA OOM: {oom}")
-        torch.cuda.empty_cache()
-        refined_assign = best_assign
-        did_improve = torch.zeros(topK, dtype=torch.bool, device=device)
-    if did_improve.sum() > 0:
-        print("FM/KL refinement improved the solution. Re-evaluating...")
-        best_solution[:,:topK] = refined_assign.to(best_solution.device)
-        best_score[:topK] = evaluation(g, best_solution[:,:topK])
-        print(f"Refined final score: {best_score.min(), best_score[0]}")
+    if K != 2:
+        print(f"FM/KL skipped for K={K} (binary-only refine)")
+    else:
+        print(f"FM/KL topK: {topK} (total_edge_degree={total_edge_degree})")
+        best_assign = best_solution[:,:topK].to(device)
+        try:
+            refined_assign, did_improve = fm_kl_refine_batch(g, best_assign, th_l, th_u, max_passes=10)
+        except torch.cuda.OutOfMemoryError as oom:
+            print(f"FM/KL refinement skipped due to CUDA OOM: {oom}")
+            torch.cuda.empty_cache()
+            refined_assign = best_assign
+            did_improve = torch.zeros(topK, dtype=torch.bool, device=device)
+        if did_improve.sum() > 0:
+            print("FM/KL refinement improved the solution. Re-evaluating...")
+            best_solution[:,:topK] = refined_assign.to(best_solution.device)
+            best_score[:topK] = evaluation(g, best_solution[:,:topK])
+            print(f"Refined final score: {best_score.min(), best_score[0]}")
 
-        scores_sorted, indices = torch.sort(best_score)
-        best_solution = best_solution[:, indices]
+            scores_sorted, indices = torch.sort(best_score)
+            best_solution = best_solution[:, indices]
 
     torch.save(best_solution[:,0].to("cpu"), config["solution_file"])
     torch.save(best_score.min().detach().cpu(), config["score_file"])
@@ -492,9 +676,14 @@ def main():
     parser.add_argument("--N_CMA_ITE", type=int, default=5, help="Number of CMA-ES iterations")
     parser.add_argument("--KWAY", type=int, default=2, help="Number of partitions")
     parser.add_argument("--UB", type=float, default=0.02, help="Upper bound for the partition size")
+    parser.add_argument("--drivers", type=str, default="", help="Driver-to-sink dot or JSON. Builds the 24-d order embedding.")
+    parser.add_argument("--lambda_f", type=float, default=1.0, help="Weight of F_net in J = C + lambda_f * F_net")
     args = parser.parse_args()
 
-    best_score = run_partitioner(args.design_root, args.design, args.device, args.tag, args.result_root, args.N_CMA_ITE, args.KWAY, args.UB)
+    best_score = run_partitioner(
+        args.design_root, args.design, args.device, args.tag, args.result_root,
+        args.N_CMA_ITE, args.KWAY, args.UB, args.drivers or None, args.lambda_f,
+    )
     print(f"Final best score: {best_score}")
 
 if __name__ == "__main__":
